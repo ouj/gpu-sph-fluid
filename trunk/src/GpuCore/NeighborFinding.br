@@ -1,0 +1,72 @@
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Neighbor Finding Kernels
+kernel int3 kCalcGridPos(float3 position, float h)
+{
+    int3 gridPos;
+
+    gridPos.x = (int)floor(position.x / h);
+    gridPos.y = (int)floor(position.y / h);
+    gridPos.z = (int)floor(position.z / h);
+
+    return gridPos;
+}
+
+kernel int kCalcGridHash(int3 gridPos, int numBucketsMinusOne)
+{
+    const int p1 = 73856093; // some large primes
+    const int p2 = 19349663;
+    const int p3 = 83492791;
+
+    int hash = (p1 * gridPos.x) ^ (p2 * gridPos.y) ^ (p3 * gridPos.z);
+    hash = abs(hash);
+    hash = hash & numBucketsMinusOne; //hash % numBuckets
+
+    return hash;
+}
+
+
+kernel void CalcGridHash(out int2 gridHash<>, float3 Position[], int posSize, float h, int numBucketsMinusOne)
+{
+    int idx = instance().x;
+    if(idx < posSize)
+    {
+        int3 gridPos = kCalcGridPos(Position[idx], h);
+        gridHash.x = kCalcGridHash(gridPos, numBucketsMinusOne);
+        gridHash.y = idx;
+    }
+    else
+    {
+        gridHash.x = -1;
+        gridHash.y = -1;
+    }
+}
+
+kernel void kFindCellRange(int2 particleHash[], out int2 cellRange[])
+{
+    int idx = instance().x;
+
+    int curVal = particleHash[idx].x;
+    int nextVal = particleHash[idx + 1].x; 
+
+    if(nextVal != curVal)
+    {
+        cellRange[curVal].y = idx + 1;
+        cellRange[nextVal].x = idx + 1;
+    }
+}
+
+kernel void kRadixScan(out int radixScan<>, int2 particleHash[], int maskBit)
+{
+    int idx = instance().x;
+	if(particleHash[idx].x & maskBit)
+		radixScan = 0;
+	else
+		radixScan = 1;
+    //radixScan = (particleHash[idx].x & maskBit) ? 0 : 1;
+}
+
+kernel void kReducePrefixSum(out int output<>, int input[])
+{
+    int idx = instance().x;
+    output = input[idx] + input[idx + 1];
+}

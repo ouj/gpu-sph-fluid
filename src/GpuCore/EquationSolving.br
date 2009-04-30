@@ -1,0 +1,232 @@
+////////////////////////////////////////////////////////////////////////////////////////////
+//Equation Solving Kernels
+kernel float squaredStandardKernel(float rr, float h)
+{
+    const float hh = h * h;  // h^2
+    const float qq = rr / hh;  // r^2/h^2
+
+    const float PI = 3.141592654f;
+
+    if (qq >= 1.0f)
+        return 0;
+    else
+    {
+        float dd = 1.0f - qq;    // (h^2 - r^2) / h^2
+        float d6 = dd * dd * dd;    // (h^2 - r^2)^3 / h^6
+        return 315.0f /(64.0f * PI * hh * h) * d6; // 315[(h^2 - r^2)^3] / 64 * PI * h^9;
+    }
+}
+
+kernel float gradientSpikeKernel(float r, float h)
+{
+    float q = r / h;
+    const float PI = 3.141592654f;
+
+    if (q >= 1.0f)
+    {
+        return 0.0f;
+    }
+    else
+    {
+        const float hh = h * h;
+        const float d = 1.0f - q;
+        return -45.0f / (PI * hh * hh) * d * d;
+    }
+}
+
+kernel float viscosityLaplacianKernel(float r, float h)
+{
+    const float PI = 3.141592654f;
+    float lap = 0.0f;
+    const float q = r / h;
+    if (q >= 1.0f)
+        return 0.0f;
+    else
+    {
+        const float hh = h * h;
+        const float d = 1.0f - q;
+
+        lap = 45.0f/(PI * hh * hh * h) * d;
+    }
+    return lap;
+}
+
+kernel int3 nCalcGridPos(float3 position, float h)
+{
+    int3 gridPos;
+
+    gridPos.x = (int)floor(position.x / h);
+    gridPos.y = (int)floor(position.y / h);
+    gridPos.z = (int)floor(position.z / h);
+
+    return gridPos;
+}
+
+kernel int nCalcGridHash(int3 gridPos, int numBucketsMinusOne)
+{
+    const int p1 = 73856093; // some large primes
+    const int p2 = 19349663;
+    const int p3 = 83492791;
+
+    int hash = (p1 * gridPos.x) ^ (p2 * gridPos.y) ^ (p3 * gridPos.z);
+    hash = abs(hash);
+    hash = hash & numBucketsMinusOne;
+
+    return hash;
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////
+// Simulation Steps
+kernel void nComputeDensities(out float densities<>, float3 positions[],
+                              int2 particleHash[], int2 cellRange[],
+                              float h, int numBucketsMinusOne)
+{
+    
+    int x, y, z;
+    int idx = instance().x;
+    float density = 1.0f;
+    int i;
+    int begin, end;
+
+    float3 pos = positions[idx];
+    int3 centerGridPos = nCalcGridPos(pos, h);
+
+    for(z = -1; z <= 1; z++)
+    {
+        for(y = -1; y <= 1; y++)
+        {
+            for(x = -1; x <= 1; x++)
+            {
+                int hash;
+                int3 gridPos = int3(x, y, z);
+                hash = nCalcGridHash(centerGridPos + gridPos, numBucketsMinusOne);
+
+                begin = cellRange[hash].x;
+                end = cellRange[hash].y;
+                for(i = begin; i < end; i++)
+                {
+                    int pIdx = particleHash[i].y;
+                    if(pIdx != idx)
+                    {
+                        float3 dr = positions[pIdx] - pos;
+                        float rr = dot(dr, dr);
+                        density += squaredStandardKernel(rr, h);
+                    }
+                }
+            }
+        }
+    }
+
+    densities = density;     
+}
+
+kernel void nComputePressures(float densities<>, out float pressures<>, float rho0, float k)
+{
+    float p;
+    p = k * (densities - rho0);
+    pressures = p / (densities * densities);
+}
+
+kernel void nComputeForces(out float3 forces<>, float pressures[], float3 positions[],
+                           float densities[], float3 velocities[],
+                           int2 particleHash[], int2 cellRange[],
+                           float3 extForce, float h, float mu,  int numBucketsMinusOne)
+{
+    int x, y, z;
+    int idx = instance().x;
+    float3 pressureForce, viscosityForce; 
+    float3 force = extForce;
+    int i;
+    int begin, end;
+
+    float3 pos = positions[idx];
+    int3 centerGridPos = nCalcGridPos(pos, h);
+
+    for(z = -1; z <= 1; z++)
+    {
+        for(y = -1; y <= 1; y++)
+        {
+            for(x = -1; x <= 1; x++)
+            {
+                int hash;
+                int3 gridPos = int3(x, y, z);
+                hash = nCalcGridHash(centerGridPos + gridPos, numBucketsMinusOne);
+
+                begin = cellRange[hash].x;
+                end = cellRange[hash].y;
+                for(i = begin; i < end; i++)
+                {
+                    int pIdx = particleHash[i].y;
+                    if(pIdx != idx)
+                    {
+                        float3 dr = positions[pIdx] - pos;
+                        float rr = dot(dr, dr);
+                        float r = sqrt(rr);
+                        pressureForce = dr * (pressures[idx] + pressures[pIdx]) * 
+                            gradientSpikeKernel(r, h);
+
+                        if(r != 0.0f)
+                            pressureForce /= r;
+
+                        force += pressureForce;
+                        viscosityForce = mu / (densities[idx] * densities[pIdx]) * 
+                            viscosityLaplacianKernel(r, h) * (velocities[pIdx] - velocities[idx]);
+
+                        force += viscosityForce;
+                    }
+                }
+            }
+        }
+    }
+    forces = force;
+}
+
+
+kernel void nUpdateParticles(out float3 newPositions<>, out float3 newVelocities<>, float3 positions<>, 
+                              float3 velocities<>, float3 forces<>, float dt, float3 sceneSize)
+{
+    float3 vel = velocities + forces * dt;
+    float3 pos = positions + (velocities  + forces * dt * 1.5f) * dt;
+
+    float3 halfSceneSize = sceneSize / 2;
+
+    const float damping = 0.2f;
+    const float kPushOutFactor = 0.01f;// Push out a little
+
+    if (pos.y <= -(halfSceneSize.y))
+    {
+        pos.y = -(halfSceneSize.y) + kPushOutFactor;
+        vel.y = -vel.y * damping;
+        vel.x *= 0.95f;
+        vel.z *= 0.95f;
+    }
+    if(pos.y >= (halfSceneSize.y))
+    {
+        pos.y = (halfSceneSize.y) - kPushOutFactor;
+        vel.y = -vel.y * damping;
+    }
+    if (pos.x <= -(halfSceneSize.x))
+    {
+        pos.x = -(halfSceneSize.x) + kPushOutFactor;
+        vel.x = -vel.x * damping;
+    }
+    if (pos.x >= (halfSceneSize.x))
+    {
+        pos.x = (halfSceneSize.x) - kPushOutFactor;
+        vel.x = -vel.x * damping;
+    }
+    if (pos.z <= -(halfSceneSize.z))
+    {
+        pos.z = -(halfSceneSize.z) + kPushOutFactor;
+        vel.z = -vel.z * damping;
+    }
+    if( pos.z >= (halfSceneSize.z))
+    {
+        pos.z = (halfSceneSize.z) - kPushOutFactor;
+        vel.z = -vel.z * damping;
+    }
+
+    newVelocities = vel;
+    newPositions = pos;
+}
